@@ -191,3 +191,132 @@ static int dispatch(Session *s, const char *line)
     net_send_line(s->fd, overflow ? "ERR TOO_MANY_ARGUMENTS" : "ERR UNKNOWN_COMMAND");
     return HANDLER_CONTINUE;
 }
+
+/* ------------------------------------------------------ worker thread ---- */
+typedef struct {
+    int  fd;
+    char peer[48];
+} ClientCtx;
+
+static void *worker(void *arg)
+{
+    ClientCtx *ctx = arg;
+    Session s;
+    memset(&s, 0, sizeof s);
+    s.fd = ctx->fd;
+    snprintf(s.peer, sizeof s.peer, "%s", ctx->peer);
+    free(ctx);
+
+    printf("[%s] connected\n", s.peer);
+
+    s.db = db_open(DB_PATH);                    /* this thread's own connection */
+    if (!s.db) {
+        net_send_line(s.fd, "ERR INTERNAL database unavailable");
+    } else {
+        LineReader r;
+        net_reader_init(&r, s.fd);
+        net_send_line(s.fd, "OK BANK READY");
+
+        char line[MAX_LINE];
+        for (;;) {
+            int n = net_read_line(&r, line, sizeof line);
+            if (n == NET_EOF || n == NET_ERR) break;
+            if (n == NET_TIMEOUT) { net_send_line(s.fd, "ERR IDLE_TIMEOUT"); break; }
+            if (n == NET_TOO_LONG) { net_send_line(s.fd, "ERR LINE_TOO_LONG"); continue; }
+            if (n == 0) continue;
+            if (dispatch(&s, line) == HANDLER_CLOSE) break;
+        }
+    }
+
+    /* Cleanup runs on EVERY exit path: normal quit, crash, timeout, dropped cable.
+     * This is why a dead client can never leave its user "stuck logged in". */
+    session_logout(&s);
+    db_close(s.db);
+    close(s.fd);
+    client_slot_release();
+    printf("[%s] disconnected\n", s.peer);
+    return NULL;
+}
+
+/* --------------------------------------------------------------- main ---- */
+static void on_signal(int sig) { (void)sig; g_stop = 1; }
+
+int main(int argc, char **argv)
+{
+    int port = DEFAULT_PORT, seed_demo = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--seed-demo") == 0) { seed_demo = 1; continue; }
+        port = atoi(argv[i]);
+        if (port < 1 || port > 65535) {
+            fprintf(stderr, "usage: %s [--seed-demo] [port]\n", argv[0]);
+            return 1;
+        }
+    }
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
+    int lock_fd = acquire_server_lock();
+    if (lock_fd < 0) return 1;
+
+    /* Make sure the schema exists before any client connects. */
+    sqlite3 *boot = db_open(DB_PATH);
+    if (!boot || db_init_schema(boot) != DB_OK) { fprintf(stderr, "database setup failed\n"); return 1; }
+    if (auth_init() != 0)                       { fprintf(stderr, "auth setup failed\n"); return 1; }
+    if (auth_bootstrap(boot, seed_demo) != 0)   { fprintf(stderr, "first-run setup failed\n"); return 1; }
+    db_close(boot);
+
+    session_global_init();
+
+    signal(SIGPIPE, SIG_IGN);                   /* writing to a closed socket -> error, not death */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_signal;                  /* no SA_RESTART: accept() must wake up on Ctrl+C */
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    int lfd = net_listen(port);
+    if (lfd < 0) return 1;
+    printf("Bank server listening on port %d (max %d clients, idle timeout %ds)\n",
+           port, MAX_CLIENTS, IDLE_TIMEOUT_SEC);
+
+    while (!g_stop) {
+        struct sockaddr_in peer;
+        socklen_t plen = sizeof peer;
+        int cfd = accept(lfd, (struct sockaddr *)&peer, &plen);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;       /* signal: loop re-checks g_stop */
+            perror("accept");
+            usleep(100000);                     /* avoid a busy loop on persistent errors */
+            continue;
+        }
+
+        /* Semaphore check: is there a free slot? Reject politely if not. */
+        if (!client_slot_try_acquire()) {
+            net_send_line(cfd, "ERR SERVER_BUSY try again later");
+            close(cfd);
+            continue;
+        }
+
+        struct timeval tv = { IDLE_TIMEOUT_SEC, 0 };
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);   /* read() gives up after this */
+
+        ClientCtx *ctx = malloc(sizeof *ctx);
+        if (!ctx) { close(cfd); client_slot_release(); continue; }
+        ctx->fd = cfd;
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
+        snprintf(ctx->peer, sizeof ctx->peer, "%s:%d", ip, ntohs(peer.sin_port));
+
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, worker, ctx) != 0) {
+            perror("pthread_create");
+            close(cfd); free(ctx); client_slot_release();
+            continue;
+        }
+        pthread_detach(tid);                    /* nobody joins workers; they clean up themselves */
+    }
+
+    printf("Shutting down.\n");
+    close(lfd);
+    close(lock_fd);                             /* releases the lock */
+    return 0;
+}
