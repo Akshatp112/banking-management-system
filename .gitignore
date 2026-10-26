@@ -1,0 +1,18 @@
+# build output
+bank_server
+bank_client
+bank_server_test
+bank_server_stress
+test_db
+*.o
+
+# runtime data
+bank.db
+bank.db-wal
+bank.db-shm
+bank.lock
+test_bank.db*
+server.log
+
+# python
+__pycache__/
