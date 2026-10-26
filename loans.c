@@ -183,3 +183,163 @@ static int exec3(sqlite3 *db, const char *sql, long long a, long long b, long lo
     sqlite3_finalize(st);
     return rc == SQLITE_DONE ? 0 : -1;
 }
+
+/* ================================================================ CUSTOMER == */
+
+/* LOAN_QUOTE amount months -> "OK emi total_payable rate%" (changes nothing) */
+int cmd_loan_quote(Session *s, int argc, char **argv, const char *rest)
+{
+    (void)rest;
+    paise_t principal; int months;
+    if (argc != 3) { net_send_line(s->fd, "ERR USAGE LOAN_QUOTE amount months"); return HANDLER_CONTINUE; }
+    if (parse_principal_and_months(s, argv, &principal, &months) != 0) return HANDLER_CONTINUE;
+
+    int rate = loan_rate_bp(months);
+    paise_t emi = compute_emi(principal, rate, months);
+    char e[32], t[32], r[16];
+    money_format(emi, e, sizeof e);
+    money_format(emi * months, t, sizeof t);
+    fmt_rate(rate, r, sizeof r);
+    net_send_line(s->fd, "OK %s %s %s", e, t, r);
+    return HANDLER_CONTINUE;
+}
+
+/* APPLY_LOAN amount months -> "OK loan_id emi rate%" */
+int cmd_apply_loan(Session *s, int argc, char **argv, const char *rest)
+{
+    (void)rest;
+    paise_t principal; int months;
+    if (argc != 3) { net_send_line(s->fd, "ERR USAGE APPLY_LOAN amount months"); return HANDLER_CONTINUE; }
+    if (parse_principal_and_months(s, argv, &principal, &months) != 0) return HANDLER_CONTINUE;
+
+    int rate = loan_rate_bp(months);
+    paise_t emi = compute_emi(principal, rate, months);
+
+    int rc = db_begin(s->db);
+    if (rc != DB_OK) { reply_begin_failure(s, rc); return HANDLER_CONTINUE; }
+
+    const char *err = NULL;
+    AcctInfo a;
+    sqlite3_stmt *st = NULL;
+    long long loan_id = 0;
+
+    int f = account_by_user(s->db, s->user_id, &a);
+    if (f < 0)  { err = "INTERNAL"; goto fail; }
+    if (f == 0) { err = "NO_ACCOUNT"; goto fail; }
+
+    /* The open-loan limit is checked under the write lock, so two simultaneous
+     * applications cannot both slip under it. */
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT COUNT(*) FROM Loans WHERE account_id = ?1 AND status IN ('PENDING','ASSIGNED','APPROVED');",
+            -1, &st, NULL) != SQLITE_OK) { err = "INTERNAL"; goto fail; }
+    sqlite3_bind_int64(st, 1, a.account_id);
+    int open = (sqlite3_step(st) == SQLITE_ROW) ? (int)sqlite3_column_int64(st, 0) : LOAN_MAX_OPEN;
+    sqlite3_finalize(st); st = NULL;
+    if (open >= LOAN_MAX_OPEN) { err = "TOO_MANY_LOANS"; goto fail; }
+
+    if (sqlite3_prepare_v2(s->db,
+            "INSERT INTO Loans(account_id, principal_paise, rate_bp, tenure_months, emi_paise) "
+            "VALUES(?1, ?2, ?3, ?4, ?5);", -1, &st, NULL) != SQLITE_OK) { err = "INTERNAL"; goto fail; }
+    sqlite3_bind_int64(st, 1, a.account_id);
+    sqlite3_bind_int64(st, 2, principal);
+    sqlite3_bind_int64(st, 3, rate);
+    sqlite3_bind_int64(st, 4, months);
+    sqlite3_bind_int64(st, 5, emi);
+    int step = sqlite3_step(st);
+    sqlite3_finalize(st); st = NULL;
+    if (step != SQLITE_DONE) { err = "INTERNAL"; goto fail; }
+    loan_id = sqlite3_last_insert_rowid(s->db);
+
+    char detail[96], money[32];
+    money_format(principal, money, sizeof money);
+    snprintf(detail, sizeof detail, "loan %lld: Rs %s for %d months", loan_id, money, months);
+    audit_log(s->db, s->user_id, "LOAN_APPLIED", detail);
+
+    if (db_commit(s->db) != DB_OK) { net_send_line(s->fd, "ERR INTERNAL"); return HANDLER_CONTINUE; }
+
+    char e[32], r[16];
+    money_format(emi, e, sizeof e);
+    fmt_rate(rate, r, sizeof r);
+    net_send_line(s->fd, "OK %lld %s %s", loan_id, e, r);
+    return HANDLER_CONTINUE;
+
+fail:
+    if (st) sqlite3_finalize(st);
+    db_rollback(s->db);
+    net_send_line(s->fd, "ERR %s", err);
+    return HANDLER_CONTINUE;
+}
+
+int cmd_my_loans(Session *s, int argc, char **argv, const char *rest)
+{
+    (void)argv; (void)rest;
+    if (argc != 1) { net_send_line(s->fd, "ERR USAGE MY_LOANS"); return HANDLER_CONTINUE; }
+    reply_loans(s, LOAN_SELECT "WHERE a.user_id = ?1 ORDER BY l.loan_id DESC LIMIT 100;", 1);
+    return HANDLER_CONTINUE;
+}
+
+/* REPAY loan_id [amount]   (no amount = pay one EMI, or whatever is left if less)
+ * -> "OK txn_id balance outstanding" */
+int cmd_repay(Session *s, int argc, char **argv, const char *rest)
+{
+    (void)rest;
+    int loan_id;
+    paise_t amt = 0;
+    if ((argc != 2 && argc != 3) || id_parse(argv[1], &loan_id) != 0) {
+        net_send_line(s->fd, "ERR USAGE REPAY loan_id [amount]");
+        return HANDLER_CONTINUE;
+    }
+    if (argc == 3 && money_parse(argv[2], &amt) != 0) {
+        net_send_line(s->fd, "ERR INVALID_AMOUNT");
+        return HANDLER_CONTINUE;
+    }
+
+    int rc = db_begin(s->db);
+    if (rc != DB_OK) { reply_begin_failure(s, rc); return HANDLER_CONTINUE; }
+
+    const char *err = NULL;
+    Loan l;
+    AcctInfo a;
+    long long txn_id;
+
+    int f = load_loan(s->db, loan_id, s->user_id, &l);                  /* only MY loans are visible */
+    if (f < 0)  { err = "INTERNAL"; goto fail; }
+    if (f == 0) { err = "NO_SUCH_LOAN"; goto fail; }
+    if (strcmp(l.status, "APPROVED") != 0) { err = "LOAN_NOT_ACTIVE"; goto fail; }
+
+    if (argc == 2) amt = l.emi < l.outstanding ? l.emi : l.outstanding;
+    if (amt > l.outstanding) { err = "EXCEEDS_OUTSTANDING"; goto fail; }
+
+    f = account_by_user(s->db, s->user_id, &a);
+    if (f < 0)  { err = "INTERNAL"; goto fail; }
+    if (f == 0) { err = "NO_ACCOUNT"; goto fail; }
+    if (!a.active) { err = "ACCOUNT_DEACTIVATED"; goto fail; }
+    if (a.balance < amt) { err = "INSUFFICIENT_FUNDS"; goto fail; }
+
+    paise_t new_balance = a.balance - amt, new_outstanding = l.outstanding - amt;
+    if (account_set_balance(s->db, a.account_id, new_balance) != 0 ||
+        exec3(s->db, "UPDATE Loans SET outstanding_paise = ?1, status = CASE WHEN ?1 = 0 THEN 'CLOSED' ELSE status END "
+                     "WHERE loan_id = ?2;", new_outstanding, l.id, -1) != 0 ||
+        exec3(s->db, "INSERT INTO Repayments(loan_id, amount_paise) VALUES(?1, ?2);", l.id, amt, -1) != 0) {
+        err = "INTERNAL"; goto fail;
+    }
+    char detail[64];
+    snprintf(detail, sizeof detail, "loan %lld repayment", l.id);
+    txn_id = ledger_record(s->db, a.account_id, "LOAN_REPAY", amt, new_balance, detail);
+    if (txn_id < 0) { err = "INTERNAL"; goto fail; }
+
+    if (new_outstanding == 0) audit_log(s->db, s->user_id, "LOAN_CLOSED", detail);
+
+    if (db_commit(s->db) != DB_OK) { net_send_line(s->fd, "ERR INTERNAL"); return HANDLER_CONTINUE; }
+
+    char bal[32], out[32];
+    money_format(new_balance, bal, sizeof bal);
+    money_format(new_outstanding, out, sizeof out);
+    net_send_line(s->fd, "OK %lld %s %s", txn_id, bal, out);
+    return HANDLER_CONTINUE;
+
+fail:
+    db_rollback(s->db);
+    net_send_line(s->fd, "ERR %s", err);
+    return HANDLER_CONTINUE;
+}
