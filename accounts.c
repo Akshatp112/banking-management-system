@@ -166,3 +166,68 @@ int cmd_deposit(Session *s, int argc, char **argv, const char *rest)
 
 int cmd_withdraw(Session *s, int argc, char **argv, const char *rest)
 { (void)rest; return cash_operation(s, argc, argv, 0); }
+
+/* ------------------------------------------------------------ TRANSFER ---- */
+int cmd_transfer(Session *s, int argc, char **argv, const char *rest)
+{
+    (void)rest;
+    int to_id;
+    paise_t amt;
+
+    if (argc != 3) { net_send_line(s->fd, "ERR USAGE TRANSFER to_account amount"); return HANDLER_CONTINUE; }
+    if (id_parse(argv[1], &to_id) != 0)    { net_send_line(s->fd, "ERR NO_SUCH_ACCOUNT"); return HANDLER_CONTINUE; }
+    if (money_parse(argv[2], &amt) != 0) {
+        net_send_line(s->fd, "ERR INVALID_AMOUNT use e.g. 250 or 250.75 (max 1 crore)");
+        return HANDLER_CONTINUE;
+    }
+
+    const char *err = NULL;
+    AcctInfo from, to;
+    long long txn_id = -1;
+    char detail[96], money_amt[32];
+
+    int rc = db_begin(s->db);
+    if (rc != DB_OK) { reply_begin_failure(s, rc); return HANDLER_CONTINUE; }
+
+    int f = load_account(s->db, SQL_ACCT_BY_USER, s->user_id, &from);
+    if (f < 0)  { err = "INTERNAL";   goto fail; }
+    if (f == 0) { err = "NO_ACCOUNT"; goto fail; }
+    if (!from.active) { err = "ACCOUNT_DEACTIVATED"; goto fail; }
+
+    int t = load_account(s->db, SQL_ACCT_BY_ID, to_id, &to);
+    if (t < 0)  { err = "INTERNAL"; goto fail; }
+    if (t == 0) { err = "NO_SUCH_ACCOUNT"; goto fail; }               /* the senior's code lost the money here */
+    if (to.account_id == from.account_id) { err = "SAME_ACCOUNT"; goto fail; }
+    if (!to.active) { err = "TARGET_UNAVAILABLE"; goto fail; }
+
+    if (from.balance < amt)                        { err = "INSUFFICIENT_FUNDS"; goto fail; }
+    if (to.balance > MAX_BALANCE_PAISE - amt)      { err = "LIMIT_EXCEEDED";     goto fail; }
+
+    paise_t from_after = from.balance - amt, to_after = to.balance + amt;
+
+    /* Both sides change inside ONE transaction: either both happen or neither. */
+    if (account_set_balance(s->db, from.account_id, from_after) != 0 ||
+        account_set_balance(s->db, to.account_id,   to_after)   != 0) { err = "INTERNAL"; goto fail; }
+
+    snprintf(detail, sizeof detail, "to account %d", to.account_id);
+    txn_id = ledger_record(s->db, from.account_id, "TRANSFER_OUT", amt, from_after, detail);
+    snprintf(detail, sizeof detail, "from account %d", from.account_id);
+    if (txn_id < 0 ||
+        ledger_record(s->db, to.account_id, "TRANSFER_IN", amt, to_after, detail) < 0) { err = "INTERNAL"; goto fail; }
+
+    money_format(amt, money_amt, sizeof money_amt);
+    snprintf(detail, sizeof detail, "account %d -> account %d, Rs %s", from.account_id, to.account_id, money_amt);
+    audit_log(s->db, s->user_id, "TRANSFER", detail);                 /* inside the transaction: logged iff it happened */
+
+    if (db_commit(s->db) != DB_OK) { net_send_line(s->fd, "ERR INTERNAL"); return HANDLER_CONTINUE; }
+
+    char money_bal[32];
+    money_format(from_after, money_bal, sizeof money_bal);
+    net_send_line(s->fd, "OK %lld %s", txn_id, money_bal);
+    return HANDLER_CONTINUE;
+
+fail:
+    db_rollback(s->db);
+    net_send_line(s->fd, "ERR %s", err);
+    return HANDLER_CONTINUE;
+}
