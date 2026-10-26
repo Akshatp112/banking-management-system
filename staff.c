@@ -331,3 +331,67 @@ int cmd_review_feedback(Session *s, int argc, char **argv, const char *rest)
     reply_rows(s, st, 50);
     return HANDLER_CONTINUE;
 }
+
+/* =============================================================== ADMIN ==== */
+
+/* SET_ROLE user_id 2|3 : switch between employee and manager. Customers (they own
+ * accounts) and admins are out of reach on purpose; nobody can change themselves. */
+int cmd_set_role(Session *s, int argc, char **argv, const char *rest)
+{
+    (void)rest;
+    int target_id, new_role;
+    if (argc != 3 || id_parse(argv[1], &target_id) != 0 || id_parse(argv[2], &new_role) != 0) {
+        net_send_line(s->fd, "ERR USAGE SET_ROLE user_id 2|3   (2=employee, 3=manager)");
+        return HANDLER_CONTINUE;
+    }
+    if (new_role != ROLE_EMPLOYEE && new_role != ROLE_MANAGER) { net_send_line(s->fd, "ERR INVALID_ROLE"); return HANDLER_CONTINUE; }
+
+    int rc = db_begin(s->db);
+    if (rc != DB_OK) { reply_begin_failure(s, rc); return HANDLER_CONTINUE; }
+
+    const char *err = NULL;
+    UserRow u;
+    int f = load_user(s->db, 1, target_id, NULL, &u);
+    if (f < 0)  { err = "INTERNAL"; goto fail; }
+    if (f == 0) { err = "NO_SUCH_USER"; goto fail; }
+    if (u.id == s->user_id) { err = "CANNOT_CHANGE_SELF"; goto fail; }
+    if (u.role != ROLE_EMPLOYEE && u.role != ROLE_MANAGER) { err = "FORBIDDEN_TARGET"; goto fail; }
+
+    if (run_update(s->db, "UPDATE Users SET role = ?1 WHERE user_id = ?2;", NULL, new_role, target_id) != 0) {
+        err = "INTERNAL"; goto fail;
+    }
+    char detail[96];
+    snprintf(detail, sizeof detail, "user %d ('%s') role %d -> %d", u.id, u.name, u.role, new_role);
+    audit_log(s->db, s->user_id, "SET_ROLE", detail);
+
+    if (db_commit(s->db) != DB_OK) { net_send_line(s->fd, "ERR INTERNAL"); return HANDLER_CONTINUE; }
+    net_send_line(s->fd, "OK ROLE_CHANGED");
+    return HANDLER_CONTINUE;
+
+fail:
+    db_rollback(s->db);
+    net_send_line(s->fd, "ERR %s", err);
+    return HANDLER_CONTINUE;
+}
+
+/* VIEW_AUDIT [n] -> latest n (default 20, max 100): id|time|user|action|details */
+int cmd_view_audit(Session *s, int argc, char **argv, const char *rest)
+{
+    (void)rest;
+    int n = 20;
+    if (argc > 2 || (argc == 2 && (id_parse(argv[1], &n) != 0 || n > 100))) {
+        net_send_line(s->fd, "ERR USAGE VIEW_AUDIT [count up to 100]");
+        return HANDLER_CONTINUE;
+    }
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT l.log_id, l.created_at, COALESCE(u.username, '-'), l.action, COALESCE(l.details, '') "
+            "FROM AuditLog l LEFT JOIN Users u ON u.user_id = l.user_id "
+            "ORDER BY l.log_id DESC LIMIT ?1;", -1, &st, NULL) != SQLITE_OK) {
+        net_send_line(s->fd, "ERR INTERNAL");
+        return HANDLER_CONTINUE;
+    }
+    sqlite3_bind_int64(st, 1, n);
+    reply_rows(s, st, n);
+    return HANDLER_CONTINUE;
+}
