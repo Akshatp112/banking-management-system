@@ -343,3 +343,132 @@ fail:
     net_send_line(s->fd, "ERR %s", err);
     return HANDLER_CONTINUE;
 }
+
+/* ================================================================= MANAGER == */
+
+int cmd_pending_loans(Session *s, int argc, char **argv, const char *rest)
+{
+    (void)argv; (void)rest;
+    if (argc != 1) { net_send_line(s->fd, "ERR USAGE PENDING_LOANS"); return HANDLER_CONTINUE; }
+    reply_loans(s, LOAN_SELECT "WHERE l.status = 'PENDING' ORDER BY l.loan_id ASC LIMIT 100;", 0);
+    return HANDLER_CONTINUE;
+}
+
+/* ASSIGN_LOAN loan_id employee_user_id : PENDING -> ASSIGNED (or re-assign while still undecided) */
+int cmd_assign_loan(Session *s, int argc, char **argv, const char *rest)
+{
+    (void)rest;
+    int loan_id, emp_id;
+    if (argc != 3 || id_parse(argv[1], &loan_id) != 0 || id_parse(argv[2], &emp_id) != 0) {
+        net_send_line(s->fd, "ERR USAGE ASSIGN_LOAN loan_id employee_user_id");
+        return HANDLER_CONTINUE;
+    }
+
+    int rc = db_begin(s->db);
+    if (rc != DB_OK) { reply_begin_failure(s, rc); return HANDLER_CONTINUE; }
+
+    const char *err = NULL;
+    Loan l;
+    sqlite3_stmt *st = NULL;
+
+    int f = load_loan(s->db, loan_id, 0, &l);
+    if (f < 0)  { err = "INTERNAL"; goto fail; }
+    if (f == 0) { err = "NO_SUCH_LOAN"; goto fail; }
+    if (strcmp(l.status, "PENDING") != 0 && strcmp(l.status, "ASSIGNED") != 0) { err = "LOAN_NOT_ASSIGNABLE"; goto fail; }
+
+    /* The assignee must be a real, active EMPLOYEE (not a manager, not a customer). */
+    if (sqlite3_prepare_v2(s->db, "SELECT username FROM Users WHERE user_id = ?1 AND role = 2 AND is_active = 1;",
+                           -1, &st, NULL) != SQLITE_OK) { err = "INTERNAL"; goto fail; }
+    sqlite3_bind_int64(st, 1, emp_id);
+    int is_emp = (sqlite3_step(st) == SQLITE_ROW);
+    sqlite3_finalize(st); st = NULL;
+    if (!is_emp) { err = "NO_SUCH_EMPLOYEE"; goto fail; }
+
+    if (exec3(s->db, "UPDATE Loans SET assigned_to = ?1, status = 'ASSIGNED' WHERE loan_id = ?2;", emp_id, l.id, -1) != 0) {
+        err = "INTERNAL"; goto fail;
+    }
+    char detail[64];
+    snprintf(detail, sizeof detail, "loan %lld -> employee %d", l.id, emp_id);
+    audit_log(s->db, s->user_id, "LOAN_ASSIGNED", detail);
+
+    if (db_commit(s->db) != DB_OK) { net_send_line(s->fd, "ERR INTERNAL"); return HANDLER_CONTINUE; }
+    net_send_line(s->fd, "OK ASSIGNED");
+    return HANDLER_CONTINUE;
+
+fail:
+    if (st) sqlite3_finalize(st);
+    db_rollback(s->db);
+    net_send_line(s->fd, "ERR %s", err);
+    return HANDLER_CONTINUE;
+}
+
+/* ================================================================ EMPLOYEE == */
+
+int cmd_view_assigned(Session *s, int argc, char **argv, const char *rest)
+{
+    (void)argv; (void)rest;
+    if (argc != 1) { net_send_line(s->fd, "ERR USAGE VIEW_ASSIGNED"); return HANDLER_CONTINUE; }
+    reply_loans(s, LOAN_SELECT "WHERE l.assigned_to = ?1 AND l.status = 'ASSIGNED' ORDER BY l.loan_id ASC LIMIT 100;", 1);
+    return HANDLER_CONTINUE;
+}
+
+/* PROCESS_LOAN loan_id APPROVE|REJECT */
+int cmd_process_loan(Session *s, int argc, char **argv, const char *rest)
+{
+    (void)rest;
+    int loan_id;
+    int approve = 0;
+    if (argc != 3 || id_parse(argv[1], &loan_id) != 0 ||
+        !((approve = (strcasecmp(argv[2], "APPROVE") == 0)) || strcasecmp(argv[2], "REJECT") == 0)) {
+        net_send_line(s->fd, "ERR USAGE PROCESS_LOAN loan_id APPROVE|REJECT");
+        return HANDLER_CONTINUE;
+    }
+
+    int rc = db_begin(s->db);
+    if (rc != DB_OK) { reply_begin_failure(s, rc); return HANDLER_CONTINUE; }
+
+    const char *err = NULL;
+    Loan l;
+    AcctInfo a;
+    long long txn_id = 0;
+    char detail[96];
+
+    /* Re-read the loan under the write lock. If the manager reassigned it a
+     * millisecond ago, or it was already decided, we see that here and refuse. */
+    int f = load_loan(s->db, loan_id, 0, &l);
+    if (f < 0)  { err = "INTERNAL"; goto fail; }
+    if (f == 0 || l.assigned_to != s->user_id || strcmp(l.status, "ASSIGNED") != 0) { err = "NO_SUCH_LOAN"; goto fail; }
+
+    if (approve) {
+        f = account_by_id(s->db, l.account_id, &a);
+        if (f < 0)  { err = "INTERNAL"; goto fail; }
+        if (f == 0) { err = "NO_ACCOUNT"; goto fail; }
+        if (!a.active) { err = "ACCOUNT_DEACTIVATED"; goto fail; }      /* loan stays ASSIGNED; retry after reactivation */
+        if (a.balance > MAX_BALANCE_PAISE - l.principal) { err = "LIMIT_EXCEEDED"; goto fail; }
+
+        paise_t new_balance = a.balance + l.principal;
+        if (exec3(s->db, "UPDATE Loans SET status = 'APPROVED', outstanding_paise = ?1 WHERE loan_id = ?2;",
+                  l.emi * l.months, l.id, -1) != 0 ||
+            account_set_balance(s->db, a.account_id, new_balance) != 0) { err = "INTERNAL"; goto fail; }
+
+        snprintf(detail, sizeof detail, "loan %lld disbursed", l.id);
+        txn_id = ledger_record(s->db, a.account_id, "LOAN_DISBURSE", l.principal, new_balance, detail);
+        if (txn_id < 0) { err = "INTERNAL"; goto fail; }
+        snprintf(detail, sizeof detail, "loan %lld approved", l.id);
+        audit_log(s->db, s->user_id, "LOAN_APPROVED", detail);
+    } else {
+        if (exec3(s->db, "UPDATE Loans SET status = 'REJECTED' WHERE loan_id = ?1;", l.id, -1, -1) != 0) { err = "INTERNAL"; goto fail; }
+        snprintf(detail, sizeof detail, "loan %lld rejected", l.id);
+        audit_log(s->db, s->user_id, "LOAN_REJECTED", detail);
+    }
+
+    if (db_commit(s->db) != DB_OK) { net_send_line(s->fd, "ERR INTERNAL"); return HANDLER_CONTINUE; }
+    if (approve) net_send_line(s->fd, "OK APPROVED %lld", txn_id);
+    else         net_send_line(s->fd, "OK REJECTED");
+    return HANDLER_CONTINUE;
+
+fail:
+    db_rollback(s->db);
+    net_send_line(s->fd, "ERR %s", err);
+    return HANDLER_CONTINUE;
+}
