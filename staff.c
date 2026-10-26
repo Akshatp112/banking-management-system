@@ -271,3 +271,63 @@ int cmd_find_user(Session *s, int argc, char **argv, const char *rest)
     net_send_line(s->fd, "OK %d %d %d %d", u.id, u.role, u.active, u.account_id);
     return HANDLER_CONTINUE;
 }
+
+/* ============================================================== MANAGER === */
+
+/* SET_ACTIVE user_id 0|1   manager: customers only; admin: anyone but themselves */
+int cmd_set_active(Session *s, int argc, char **argv, const char *rest)
+{
+    (void)rest;
+    int target_id;
+    if (argc != 3 || id_parse(argv[1], &target_id) != 0 ||
+        (strcmp(argv[2], "0") != 0 && strcmp(argv[2], "1") != 0)) {
+        net_send_line(s->fd, "ERR USAGE SET_ACTIVE user_id 0|1");
+        return HANDLER_CONTINUE;
+    }
+    int flag = argv[2][0] - '0';
+
+    int rc = db_begin(s->db);
+    if (rc != DB_OK) { reply_begin_failure(s, rc); return HANDLER_CONTINUE; }
+
+    const char *err = NULL;
+    UserRow u;
+    int f = load_user(s->db, 1, target_id, NULL, &u);
+    if (f < 0)  { err = "INTERNAL"; goto fail; }
+    if (f == 0) { err = "NO_SUCH_USER"; goto fail; }
+    if (u.id == s->user_id) { err = "CANNOT_CHANGE_SELF"; goto fail; }
+    if (s->role == ROLE_MANAGER && u.role != ROLE_CUSTOMER) { err = "NO_SUCH_USER"; goto fail; }
+
+    if (run_update(s->db, "UPDATE Users SET is_active = ?1 WHERE user_id = ?2;", NULL, flag, target_id) != 0) {
+        err = "INTERNAL"; goto fail;
+    }
+    char detail[96];
+    snprintf(detail, sizeof detail, "user %d ('%s') %s", u.id, u.name, flag ? "activated" : "deactivated");
+    audit_log(s->db, s->user_id, flag ? "ACCOUNT_ACTIVATED" : "ACCOUNT_DEACTIVATED", detail);
+
+    if (db_commit(s->db) != DB_OK) { net_send_line(s->fd, "ERR INTERNAL"); return HANDLER_CONTINUE; }
+    net_send_line(s->fd, "OK %s", flag ? "ACTIVATED" : "DEACTIVATED");
+    return HANDLER_CONTINUE;
+
+fail:
+    db_rollback(s->db);
+    net_send_line(s->fd, "ERR %s", err);
+    return HANDLER_CONTINUE;
+}
+
+/* REVIEW_FEEDBACK -> latest 50: id|time|username|message */
+int cmd_review_feedback(Session *s, int argc, char **argv, const char *rest)
+{
+    (void)argv; (void)rest;
+    if (argc != 1) { net_send_line(s->fd, "ERR USAGE REVIEW_FEEDBACK"); return HANDLER_CONTINUE; }
+
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT f.feedback_id, f.created_at, u.username, f.message "
+            "FROM Feedback f JOIN Users u ON u.user_id = f.user_id "
+            "ORDER BY f.feedback_id DESC LIMIT 50;", -1, &st, NULL) != SQLITE_OK) {
+        net_send_line(s->fd, "ERR INTERNAL");
+        return HANDLER_CONTINUE;
+    }
+    reply_rows(s, st, 50);
+    return HANDLER_CONTINUE;
+}
