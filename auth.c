@@ -243,3 +243,198 @@ int auth_bootstrap(sqlite3 *db, int seed_demo)
                          "           Shown only once - change it after logging in.\n", pw);
     return 0;
 }
+
+/* ----------------------------------------------------- login / lockout ---- */
+/* Record a wrong password. Doing "+1, and lock if the limit is reached" inside
+ * ONE UPDATE statement makes it atomic: if several wrong guesses arrive at the
+ * same moment, none is lost. (In step 2 we needed BEGIN IMMEDIATE because we
+ * read first and wrote later; here the read and write are the same statement.)
+ * Returns 1 if this failure just locked the account. */
+static int note_failed_attempt(sqlite3 *db, int user_id)
+{
+    static const char *sql_update =
+        "UPDATE Users SET "
+        "  locked_until    = CASE WHEN failed_attempts + 1 >= ?1 THEN ?2 ELSE locked_until END,"
+        "  failed_attempts = CASE WHEN failed_attempts + 1 >= ?1 THEN 0  ELSE failed_attempts + 1 END "
+        "WHERE user_id = ?3;";
+    time_t now = time(NULL);
+    sqlite3_stmt *st;
+
+    if (sqlite3_prepare_v2(db, sql_update, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, MAX_FAILED_ATTEMPTS);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)now + LOCKOUT_SECONDS);
+    sqlite3_bind_int64(st, 3, user_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+
+    int locked = 0;
+    if (sqlite3_prepare_v2(db, "SELECT locked_until FROM Users WHERE user_id = ?1;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, user_id);
+        if (sqlite3_step(st) == SQLITE_ROW) locked = sqlite3_column_int64(st, 0) > now;
+        sqlite3_finalize(st);
+    }
+    return locked;
+}
+
+static void clear_failed_attempts(sqlite3 *db, int user_id)
+{
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE Users SET failed_attempts = 0 WHERE user_id = ?1 AND failed_attempts <> 0;",
+            -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(st, 1, user_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+int cmd_login(Session *s, int argc, char **argv, const char *rest)
+{
+    (void)rest;
+    if (s->logged_in) { net_send_line(s->fd, "ERR ALREADY_LOGGED_IN"); return HANDLER_CONTINUE; }
+    if (argc != 3)    { net_send_line(s->fd, "ERR USAGE LOGIN username password"); return HANDLER_CONTINUE; }
+
+    const char *uname = argv[1], *pw = argv[2];
+
+    /* Malformed names can't exist in the database; refuse them with the SAME
+     * message as a wrong password so nothing about the rules leaks. */
+    if (!auth_valid_username(uname) || strlen(pw) > PASSWORD_MAX) {
+        audit_log(s->db, 0, "LOGIN_FAIL", "malformed credentials");
+        net_send_line(s->fd, "ERR INVALID_CREDENTIALS");
+        return HANDLER_CONTINUE;
+    }
+
+    /* Look the user up with a bound parameter: the username is data, never SQL. */
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT user_id, password_hash, role, is_active, locked_until "
+            "FROM Users WHERE username = ?1;", -1, &st, NULL) != SQLITE_OK) {
+        net_send_line(s->fd, "ERR INTERNAL");
+        return HANDLER_CONTINUE;
+    }
+    sqlite3_bind_text(st, 1, uname, -1, SQLITE_TRANSIENT);
+
+    int found = 0, uid = 0, role = 0, active = 0;
+    long long locked_until = 0;
+    char hash[HASH_MAX];
+    int step = sqlite3_step(st);
+    if (step == SQLITE_ROW) {
+        found        = 1;
+        uid          = (int)sqlite3_column_int64(st, 0);
+        snprintf(hash, sizeof hash, "%s", (const char *)sqlite3_column_text(st, 1));
+        role         = (int)sqlite3_column_int64(st, 2);
+        active       = (int)sqlite3_column_int64(st, 3);
+        locked_until = sqlite3_column_int64(st, 4);
+    }
+    sqlite3_finalize(st);
+    if (step != SQLITE_ROW && step != SQLITE_DONE) {
+        net_send_line(s->fd, "ERR INTERNAL");
+        return HANDLER_CONTINUE;
+    }
+
+    char detail[96];
+    if (!found) {
+        auth_verify_password(pw, dummy_hash);             /* same time cost as a real check */
+        snprintf(detail, sizeof detail, "unknown username '%s' from %s", uname, s->peer);
+        audit_log(s->db, 0, "LOGIN_FAIL", detail);
+        net_send_line(s->fd, "ERR INVALID_CREDENTIALS");
+        return HANDLER_CONTINUE;
+    }
+
+    /* Locked accounts are refused BEFORE checking the password; otherwise an
+     * attacker could keep guessing during the lock and learn when they hit. */
+    long long now = (long long)time(NULL);
+    if (locked_until > now) {
+        snprintf(detail, sizeof detail, "login while locked from %s", s->peer);
+        audit_log(s->db, uid, "LOGIN_BLOCKED", detail);
+        net_send_line(s->fd, "ERR ACCOUNT_LOCKED retry_in=%lld", locked_until - now);
+        return HANDLER_CONTINUE;
+    }
+
+    if (!auth_verify_password(pw, hash)) {
+        int locked = note_failed_attempt(s->db, uid);
+        snprintf(detail, sizeof detail, "wrong password from %s", s->peer);
+        audit_log(s->db, uid, "LOGIN_FAIL", detail);
+        if (locked) audit_log(s->db, uid, "ACCOUNT_LOCKED", "too many failed attempts");
+        net_send_line(s->fd, "ERR INVALID_CREDENTIALS");
+        return HANDLER_CONTINUE;
+    }
+
+    /* Password is right. Only now do we reveal the account's state. */
+    if (!active) {
+        audit_log(s->db, uid, "LOGIN_DENIED", "account deactivated");
+        net_send_line(s->fd, "ERR ACCOUNT_DEACTIVATED");
+        return HANDLER_CONTINUE;
+    }
+    if (role < ROLE_CUSTOMER || role > ROLE_ADMIN) {
+        net_send_line(s->fd, "ERR INTERNAL");
+        return HANDLER_CONTINUE;
+    }
+
+    clear_failed_attempts(s->db, uid);
+
+    if (session_try_login(s, uid, (Role)role) == SESSION_ALREADY) {
+        audit_log(s->db, uid, "LOGIN_DENIED", "already logged in elsewhere");
+        net_send_line(s->fd, "ERR ALREADY_LOGGED_IN");
+        return HANDLER_CONTINUE;
+    }
+
+    snprintf(detail, sizeof detail, "from %s", s->peer);
+    audit_log(s->db, uid, "LOGIN_OK", detail);
+    net_send_line(s->fd, "OK LOGGED_IN %d %d", uid, role);
+    return HANDLER_CONTINUE;
+}
+
+int cmd_change_pass(Session *s, int argc, char **argv, const char *rest)
+{
+    (void)rest;
+    if (argc != 3) { net_send_line(s->fd, "ERR USAGE CHANGE_PASS old new"); return HANDLER_CONTINUE; }
+    const char *oldpw = argv[1], *newpw = argv[2];
+
+    if (!auth_valid_password(newpw)) {
+        net_send_line(s->fd, "ERR WEAK_PASSWORD need %d-%d visible characters, no spaces", PASSWORD_MIN, PASSWORD_MAX);
+        return HANDLER_CONTINUE;
+    }
+    if (strcmp(oldpw, newpw) == 0) {
+        net_send_line(s->fd, "ERR SAME_PASSWORD");
+        return HANDLER_CONTINUE;
+    }
+
+    char hash[HASH_MAX] = "";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(s->db, "SELECT password_hash FROM Users WHERE user_id = ?1;",
+                           -1, &st, NULL) != SQLITE_OK) {
+        net_send_line(s->fd, "ERR INTERNAL");
+        return HANDLER_CONTINUE;
+    }
+    sqlite3_bind_int64(st, 1, s->user_id);
+    if (sqlite3_step(st) == SQLITE_ROW)
+        snprintf(hash, sizeof hash, "%s", (const char *)sqlite3_column_text(st, 0));
+    sqlite3_finalize(st);
+
+    if (!hash[0] || !auth_verify_password(oldpw, hash)) {
+        /* Wrong old password counts towards lockout too: someone at an
+         * unattended terminal must not be able to guess it freely. */
+        note_failed_attempt(s->db, s->user_id);
+        audit_log(s->db, s->user_id, "PASSWORD_CHANGE_FAIL", "wrong current password");
+        net_send_line(s->fd, "ERR INVALID_CREDENTIALS");
+        return HANDLER_CONTINUE;
+    }
+
+    char newhash[HASH_MAX];
+    if (auth_hash_password(newpw, newhash, sizeof newhash) != 0 ||
+        sqlite3_prepare_v2(s->db, "UPDATE Users SET password_hash = ?1 WHERE user_id = ?2;",
+                           -1, &st, NULL) != SQLITE_OK) {
+        net_send_line(s->fd, "ERR INTERNAL");
+        return HANDLER_CONTINUE;
+    }
+    sqlite3_bind_text(st, 1, newhash, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, s->user_id);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+
+    if (rc != SQLITE_DONE) { net_send_line(s->fd, "ERR INTERNAL"); return HANDLER_CONTINUE; }
+    audit_log(s->db, s->user_id, "PASSWORD_CHANGED", "");
+    net_send_line(s->fd, "OK PASSWORD_CHANGED");
+    return HANDLER_CONTINUE;
+}
