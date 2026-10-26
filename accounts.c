@@ -231,3 +231,134 @@ fail:
     net_send_line(s->fd, "ERR %s", err);
     return HANDLER_CONTINUE;
 }
+
+/* ------------------------------------------------------------- HISTORY ---- */
+/* True only for real calendar dates in YYYY-MM-DD form. SQLite normalises
+ * impossible dates (2024-02-30 -> 2024-03-01), so "date(x) == x" catches them. */
+static int valid_date(sqlite3 *db, const char *d)
+{
+    if (strlen(d) != 10 || d[4] != '-' || d[7] != '-') return 0;
+    for (int i = 0; i < 10; i++)
+        if (i != 4 && i != 7 && (d[i] < '0' || d[i] > '9')) return 0;
+
+    sqlite3_stmt *st;
+    int ok = 0;
+    if (sqlite3_prepare_v2(db, "SELECT date(?1) = ?1;", -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, d, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) ok = sqlite3_column_int64(st, 0) == 1;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int history_parse_range(Session *s, int ndates, char **dates, const char **from, const char **to)
+{
+    *from = "1970-01-01";
+    *to   = "2999-12-31";
+    if (ndates == 0) return 0;
+
+    if (!valid_date(s->db, dates[0]) || !valid_date(s->db, dates[1])) {
+        net_send_line(s->fd, "ERR INVALID_DATE use YYYY-MM-DD");
+        return -1;
+    }
+    if (strcmp(dates[0], dates[1]) > 0) { net_send_line(s->fd, "ERR INVALID_RANGE"); return -1; }
+    *from = dates[0];
+    *to   = dates[1];
+    return 0;
+}
+
+#define HISTORY_LINE 160
+
+void history_send(Session *s, int account_id, const char *from, const char *to)
+{
+    /* Collect rows first so we can announce the count ("OK n") before the rows. */
+    char *lines = malloc((size_t)HISTORY_MAX_ROWS * HISTORY_LINE);
+    if (!lines) { net_send_line(s->fd, "ERR INTERNAL"); return; }
+
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT txn_id, created_at, type, amount_paise, balance_after_paise, COALESCE(details,'') "
+            "FROM Transactions "
+            "WHERE account_id = ?1 AND created_at >= ?2 AND created_at < date(?3, '+1 day') "
+            "ORDER BY txn_id DESC LIMIT ?4;", -1, &st, NULL) != SQLITE_OK) {
+        free(lines);
+        net_send_line(s->fd, "ERR INTERNAL");
+        return;
+    }
+    sqlite3_bind_int64(st, 1, account_id);
+    sqlite3_bind_text (st, 2, from, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 3, to,   -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 4, HISTORY_MAX_ROWS);
+
+    int n = 0, rc;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW && n < HISTORY_MAX_ROWS) {
+        char amt[32], bal[32];
+        money_format(sqlite3_column_int64(st, 3), amt, sizeof amt);
+        money_format(sqlite3_column_int64(st, 4), bal, sizeof bal);
+        snprintf(lines + (size_t)n * HISTORY_LINE, HISTORY_LINE, "%lld|%s|%s|%s|%s|%s",
+                 (long long)sqlite3_column_int64(st, 0),
+                 (const char *)sqlite3_column_text(st, 1),
+                 (const char *)sqlite3_column_text(st, 2),
+                 amt, bal,
+                 (const char *)sqlite3_column_text(st, 5));
+        n++;
+    }
+    sqlite3_finalize(st);
+
+    if (rc != SQLITE_DONE && rc != SQLITE_ROW) net_send_line(s->fd, "ERR INTERNAL");
+    else {
+        net_send_line(s->fd, "OK %d", n);
+        for (int i = 0; i < n; i++) net_send_line(s->fd, "%s", lines + (size_t)i * HISTORY_LINE);
+    }
+    free(lines);
+}
+
+int cmd_history(Session *s, int argc, char **argv, const char *rest)
+{
+    (void)rest;
+    if (argc != 1 && argc != 3) {
+        net_send_line(s->fd, "ERR USAGE HISTORY [from_date to_date]  (YYYY-MM-DD)");
+        return HANDLER_CONTINUE;
+    }
+    const char *from, *to;
+    if (history_parse_range(s, argc == 3 ? 2 : 0, argv + 1, &from, &to) != 0) return HANDLER_CONTINUE;
+
+    AcctInfo a;
+    int found = account_by_user(s->db, s->user_id, &a);
+    if (found < 0)  { net_send_line(s->fd, "ERR INTERNAL");   return HANDLER_CONTINUE; }
+    if (found == 0) { net_send_line(s->fd, "ERR NO_ACCOUNT"); return HANDLER_CONTINUE; }
+
+    history_send(s, a.account_id, from, to);
+    return HANDLER_CONTINUE;
+}
+
+/* ------------------------------------------------------------ FEEDBACK ---- */
+#define FEEDBACK_MAX 400
+
+int cmd_feedback(Session *s, int argc, char **argv, const char *rest)
+{
+    (void)argv;
+    if (argc < 2 || rest[0] == '\0') { net_send_line(s->fd, "ERR USAGE FEEDBACK your message"); return HANDLER_CONTINUE; }
+
+    char msg[FEEDBACK_MAX + 1];
+    size_t len = strlen(rest);
+    if (len > FEEDBACK_MAX) { net_send_line(s->fd, "ERR TOO_LONG max %d characters", FEEDBACK_MAX); return HANDLER_CONTINUE; }
+    memcpy(msg, rest, len + 1);
+    while (len > 0 && (msg[len - 1] == ' ' || msg[len - 1] == '\t')) msg[--len] = '\0';
+    for (size_t i = 0; i < len; i++)                    /* '|' separates columns in listings */
+        if (msg[i] == '|' || msg[i] == '\t') msg[i] = (msg[i] == '|') ? '/' : ' ';
+
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(s->db, "INSERT INTO Feedback(user_id, message) VALUES(?1, ?2);",
+                           -1, &st, NULL) != SQLITE_OK) {
+        net_send_line(s->fd, "ERR INTERNAL");
+        return HANDLER_CONTINUE;
+    }
+    sqlite3_bind_int64(st, 1, s->user_id);
+    sqlite3_bind_text (st, 2, msg, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+
+    if (rc != SQLITE_DONE) net_send_line(s->fd, "ERR INTERNAL");
+    else net_send_line(s->fd, "OK %lld", (long long)sqlite3_last_insert_rowid(s->db));
+    return HANDLER_CONTINUE;
+}
